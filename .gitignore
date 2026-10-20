@@ -1,0 +1,6 @@
+# Datos locales de la app (no van al repositorio)
+ajustes.json
+registro.log
+extensiones/
+*.app
+.DS_Store
