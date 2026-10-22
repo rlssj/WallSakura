@@ -236,21 +236,39 @@ func resolucionPantalla() -> (ancho: Int, alto: Int) {
     return (Int(p.frame.width * p.backingScaleFactor) / 2 * 2, Int(p.frame.height * p.backingScaleFactor) / 2 * 2)
 }
 
-// Recodifica una vuelta del vídeo en HEVC 10 bits 4K (como los aéreos de Apple) y luego la repite
-// sin recodificar hasta 5 min: así tarda segundos en vez de minutos.
-func crearVideoBloqueo(desde url: URL, en salida: URL) async throws {
-    try? FileManager.default.removeItem(at: salida)
-    let vuelta = salida.deletingPathExtension().appendingPathExtension("vuelta.mov")
-    try? FileManager.default.removeItem(at: vuelta)
-    defer { try? FileManager.default.removeItem(at: vuelta) }
+// Una vuelta de cada fondo ya convertida al formato de los aéreos de Apple, para no recodificar cada vez
+let carpetaBloqueo = base.appendingPathComponent("bloqueo")
+
+// Nombre de la vuelta guardada: depende del vídeo (tamaño y fecha), no de su nombre, así que renombrar o mover no la invalida
+func vueltaEnCache(_ url: URL) -> URL {
+    let v = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+    let clave = "\(v?.fileSize ?? 0)-\(Int(v?.contentModificationDate?.timeIntervalSince1970 ?? 0))-\(formatoBloqueo)"
+    return carpetaBloqueo.appendingPathComponent(clave + ".mov")
+}
+
+// Recodifica una vuelta del vídeo en HEVC 10 bits 4K (como los aéreos de Apple) y la guarda; si ya estaba, la reutiliza
+func vueltaBloqueo(_ url: URL) async throws -> URL {
+    let destino = vueltaEnCache(url)
+    if FileManager.default.fileExists(atPath: destino.path) { return destino }
+    try FileManager.default.createDirectory(at: carpetaBloqueo, withIntermediateDirectories: true)
+    let temp = carpetaBloqueo.appendingPathComponent(".\(UUID().uuidString).mov")
+    defer { try? FileManager.default.removeItem(at: temp) }
     let asset = AVURLAsset(url: url)
     guard let pista = try await asset.loadTracks(withMediaType: .video).first else { throw CocoaError(.fileReadCorruptFile) }
     let duracion = try await asset.load(.duration)
-    let cinco = CMTime(seconds: 300, preferredTimescale: 600)
-    let total = CMTimeMinimum(duracion, cinco)
-
-    try await recodificar(asset, pista: pista, duracion: duracion, hasta: total, en: vuelta,
+    let total = CMTimeMinimum(duracion, CMTime(seconds: 300, preferredTimescale: 600))
+    try await recodificar(asset, pista: pista, duracion: duracion, hasta: total, en: temp,
                           ancho: 3840, alto: 2160, bitrate: 14_000_000, diezBits: true)
+    try? FileManager.default.removeItem(at: destino)
+    try FileManager.default.moveItem(at: temp, to: destino)
+    return destino
+}
+
+// Monta el vídeo de la pantalla de bloqueo: la vuelta guardada, repetida sin recodificar hasta 5 min (unos segundos)
+func crearVideoBloqueo(desde url: URL, en salida: URL) async throws {
+    try? FileManager.default.removeItem(at: salida)
+    let vuelta = try await vueltaBloqueo(url)
+    let cinco = CMTime(seconds: 300, preferredTimescale: 600)
 
     // Repetir la vuelta ya codificada hasta llegar a 5 min
     let codificado = AVURLAsset(url: vuelta)
@@ -297,7 +315,7 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
     @Published var lista: [URL] = []
     @Published var pausaManual = false
     @Published var inicio = false
-    @Published var estado = "Pantalla de bloqueo: lista"
+    @Published var estado = ""
     @Published var renombrando: URL?   // fondo o carpeta cuyo nombre se está editando
     @Published var seccion: Seccion = .todos {
         didSet {
@@ -371,7 +389,13 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
             wnc.addObserver(forName: nombre, object: nil, queue: .main) { [weak self] _ in self?.bloqueado = valor; self?.actualizar() }
         }
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.actualizar() }
-        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in self?.comprobarCambio() }
+        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            self?.comprobarCambio()
+            self?.comprobarTahoe()
+        }
+        comprobarTahoe()
+        // Pasado un rato, ir convirtiendo los fondos para la pantalla de bloqueo
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in self?.prepararCache() }
         // Por si has metido o borrado vídeos a mano en la carpeta
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
@@ -761,22 +785,31 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
     // (HEVC 10 bits, 3840×2160, ~5 min) y lo pone en el aéreo "Tahoe Day".
     func prepararBloqueo(_ url: URL) {
         tareaBloqueo?.cancel()
+        // El fondo que acabas de elegir va primero: la conversión en segundo plano se para y sigue después
+        if tareaCache != nil {
+            tareaCache?.cancel()
+            repetirCache = true
+        }
         let marca = "\(rutaRelativa(url))#\(formatoBloqueo)"
-        estado = "Pantalla de bloqueo: preparando… (tarda un poco)"
         // Nombre único: si cambias de fondo rápido, la tarea cancelada no borra el archivo de la nueva
         let temp = base.appendingPathComponent(".bloqueo-\(UUID().uuidString).mov")
-        tareaBloqueo = Task.detached(priority: .utility) { [weak self] in
+        let inicio = Date()
+        tareaBloqueo = Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 try await crearVideoBloqueo(desde: url, en: temp)
                 try Task.checkCancellation()
-                await MainActor.run { self?.instalarBloqueo(temp, marca) }
+                await MainActor.run {
+                    self?.instalarBloqueo(temp, marca)
+                    self?.log(String(format: "bloqueo: listo en %.1f s", Date().timeIntervalSince(inicio)))
+                    if self?.repetirCache == true { self?.repetirCache = false; self?.prepararCache() }
+                }
             } catch is CancellationError {
                 try? FileManager.default.removeItem(at: temp)
             } catch {
                 try? FileManager.default.removeItem(at: temp)
                 await MainActor.run {
                     self?.log("bloqueo: error al crear el vídeo: \(error as NSError)")
-                    self?.estado = "Pantalla de bloqueo: error (\(error.localizedDescription))"
+                    self?.estado = "No se pudo poner en la pantalla de bloqueo"
                 }
             }
         }
@@ -785,19 +818,76 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
     func instalarBloqueo(_ temp: URL, _ marca: String) {
         do {
             try FileManager.default.createDirectory(at: aereo.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? FileManager.default.removeItem(at: aereo)
-            try FileManager.default.moveItem(at: temp, to: aereo)
+            // Cambio de golpe: el vídeo viejo se sustituye sin un momento en el que no haya ninguno
+            if FileManager.default.fileExists(atPath: aereo.path) {
+                _ = try FileManager.default.replaceItemAt(aereo, withItemAt: temp)
+            } else {
+                try FileManager.default.moveItem(at: temp, to: aereo)
+            }
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
             p.arguments = ["WallpaperAgent"]
             try? p.run()
             ajustes.bloqueo = marca
-            if let d = try? JSONEncoder().encode(ajustes) { try? d.write(to: ajustesURL) }
-            estado = "Pantalla de bloqueo: lista"
+            guardar()
+            log("bloqueo: puesto \(marca)")
         } catch {
+            try? FileManager.default.removeItem(at: temp)
             log("bloqueo: error al instalar el vídeo: \(error as NSError)")
-            estado = "Pantalla de bloqueo: error (\(error.localizedDescription))"
+            estado = "No se pudo poner en la pantalla de bloqueo"
         }
+        comprobarTahoe()
+    }
+
+    // Va convirtiendo en segundo plano los fondos que aún no tienen su vuelta guardada,
+    // para que al elegirlos la pantalla de bloqueo esté en unos segundos. Borra las que ya no sirven.
+    var tareaCache: Task<Void, Never>?
+    var repetirCache = false
+    func prepararCache() {
+        guard tareaCache == nil else { repetirCache = true; return }
+        // Mientras se pone un fondo en la pantalla de bloqueo, esperar a que acabe
+        if tareaBloqueo != nil && ajustes.bloqueo != ajustes.actual.map({ "\($0)#\(formatoBloqueo)" }) { repetirCache = true; return }
+        let fondos = todosLosFondos()
+        tareaCache = Task.detached(priority: .background) { [weak self] in
+            for url in fondos {
+                if Task.isCancelled { break }
+                if FileManager.default.fileExists(atPath: vueltaEnCache(url).path) { continue }
+                do {
+                    _ = try await vueltaBloqueo(url)
+                } catch is CancellationError {
+                    break
+                } catch {
+                    await MainActor.run { self?.log("bloqueo: no se pudo preparar \(url.lastPathComponent): \(error.localizedDescription)") }
+                }
+            }
+            let validas = Set(todosLosFondos().map { vueltaEnCache($0).lastPathComponent })
+            for f in (try? FileManager.default.contentsOfDirectory(at: carpetaBloqueo, includingPropertiesForKeys: nil)) ?? []
+            where !validas.contains(f.lastPathComponent) && !f.lastPathComponent.hasPrefix(".") {
+                try? FileManager.default.removeItem(at: f)
+            }
+            await MainActor.run {
+                guard let self else { return }
+                let cancelada = self.tareaCache?.isCancelled == true
+                self.tareaCache = nil
+                if self.repetirCache && !cancelada { self.repetirCache = false; self.prepararCache() }
+            }
+        }
+    }
+
+    // ¿Está puesto "Tahoe Day" como fondo del Mac? Si no, la pantalla de bloqueo no puede mostrar el tuyo
+    @Published var avisoTahoe = false
+    func comprobarTahoe() {
+        let indice = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/com.apple.wallpaper/Store/Index.plist")
+        guard let datos = try? Data(contentsOf: indice),
+              let texto = String(data: datos, encoding: .isoLatin1) else { return }
+        // Basta con buscar el aéreo dentro del archivo (va dentro de una configuración codificada)
+        let elegido = texto.contains("com.apple.wallpaper.choice.aerials") && datos.range(of: Data("4C108785-A7BA-422E-9C79-B0129F1D5550".utf8)) != nil
+        if avisoTahoe != !elegido { avisoTahoe = !elegido }
+    }
+
+    func abrirAjustesFondo() {
+        if let u = URL(string: "x-apple.systempreferences:com.apple.Wallpaper-Settings.extension") { NSWorkspace.shared.open(u) }
     }
 
     // Guarda el vídeo sin audio en la carpeta de fondos, ajustado a la resolución de la pantalla
@@ -843,6 +933,7 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
                 if borrarOrigen { try? FileManager.default.removeItem(at: origen) }
                 miniaturas[salida] = nil
                 refrescar()
+                prepararCache()
                 estado = "Añadido: \(nombre)\(aviso)"
                 if ponerlo { poner(salida, bloqueo: true) }
                 terminado?(true)
@@ -999,6 +1090,7 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         do {
             try FileManager.default.removeItem(at: carpeta)
             olvidar(ruta)
+            prepararCache()   // borra también su versión para la pantalla de bloqueo
         } catch {
             estado = "No se pudo eliminar la carpeta"
             return
@@ -1039,6 +1131,7 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         do {
             try FileManager.default.removeItem(at: url)
             olvidar(ruta)
+            prepararCache()   // borra también su versión para la pantalla de bloqueo
         } catch {
             estado = "No se pudo eliminar \(nombre)"
             return
@@ -1360,9 +1453,22 @@ struct Galeria: View {
                 // Clic derecho en el espacio libre (en una tarjeta sale su propio menú)
                 .contextMenu { menuVacio }
             }
-            Text(fondo.estado)
-                .font(.callout)
-                .foregroundStyle(.secondary)
+            if fondo.avisoTahoe {
+                HStack(spacing: 10) {
+                    Image(systemName: "lock.trianglebadge.exclamationmark").foregroundStyle(Color.rosa)
+                    Text("La pantalla de bloqueo no mostrará tu fondo: el fondo del Mac tiene que ser el aéreo «Tahoe Day».")
+                        .font(.callout)
+                    Spacer()
+                    Button("Abrir Fondo de pantalla") { fondo.abrirAjustesFondo() }
+                }
+                .padding(10)
+                .background(Color.panelRosa.opacity(0.8), in: RoundedRectangle(cornerRadius: 10))
+            }
+            if !fondo.estado.isEmpty {
+                Text(fondo.estado)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(20)
         // Vídeos arrastrados desde Finder a la ventana: se añaden a la carpeta abierta
@@ -1578,7 +1684,7 @@ struct VistaAjustes: View {
             }
             Section("General") {
                 Toggle("Abrir al iniciar sesión", isOn: Binding(get: { fondo.inicio }, set: { _ in fondo.alternarInicio() }))
-                LabeledContent("Estado", value: fondo.estado)
+                if !fondo.estado.isEmpty { LabeledContent("Último aviso", value: fondo.estado) }
                 HStack {
                     Button("Abrir carpeta de fondos") { NSWorkspace.shared.open(carpetaFondos) }
                     Spacer()
