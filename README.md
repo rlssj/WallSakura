@@ -5,6 +5,9 @@ Fondos de escritorio animados para macOS, sin apps de terceros.
 - Reproduce un vídeo en bucle detrás de los iconos del escritorio y se pausa solo cuando hay ventanas encima (opcional), con la pantalla bloqueada o apagada.
 - Pone el mismo fondo en la **pantalla de bloqueo**: sustituye el vídeo del aéreo de Apple «Tahoe Day» por el tuyo, recodificado en el formato de los aéreos (HEVC 10 bits, 4K, 5 min).
 - **Explorar fondos**: navegador integrado con MoeWalls, MotionBgs, DesktopHut y WallsFlow. Lo que descargas se convierte a la resolución de tu pantalla y se añade solo. Bloquea anuncios con las listas de uBlock Origin (uBlock filters, EasyList, EasyPrivacy).
+- Barra lateral con Todos los fondos, Favoritos, tus carpetas, Explorar y Ajustes.
+- Favoritos (corazón en cada fondo) y **cambio automático** cada cierto tiempo, al azar o en orden, de todos los fondos, de los favoritos o de una carpeta.
+- **Un fondo distinto en cada pantalla** si tienes varios monitores; cada pantalla se pausa por su cuenta.
 - Carpetas, orden por arrastre, renombrar en el sitio, clic derecho para mover, mostrar en Finder o eliminar.
 - Interfaz rosa en modo claro y granate en modo oscuro. Icono hecho con Icon Composer, con versión clara y oscura.
 

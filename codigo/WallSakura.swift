@@ -104,7 +104,58 @@ struct Ajustes: Codable {
     var firma: String?
     var bloqueo: String?   // qué vídeo (y versión del formato) hay en la pantalla de bloqueo
     var pausarConVentanas: Bool?   // nil = sí (lo de siempre)
-    var orden: [String: [String]]?   // orden puesto a mano en cada carpeta ("" = Todos los fondos): nombres de archivo
+    var orden: [String: [String]]?   // orden puesto a mano en cada carpeta ("" = Sin carpeta): nombres de archivo
+    var favoritos: [String]?   // rutas relativas, en el orden en que se ven
+    var cambio: CambioAuto?
+    var ultimoCambio: Date?
+    var pantallas: [String: String]?   // fondo propio de cada pantalla que no es la principal: id de pantalla → ruta
+}
+
+// Cambio automático de fondo
+struct CambioAuto: Codable, Equatable {
+    var activo = false
+    var minutos = 30
+    var aleatorio = true
+    var origen = "todos"   // "todos", "favoritos" o "carpeta:<nombre>"
+}
+
+// Secciones de la barra lateral
+enum Seccion: Hashable {
+    case todos, favoritos, sueltos, ajustes
+    case carpeta(URL)
+}
+
+// Una pantalla del Mac: su ventana detrás de los iconos y su propio reproductor
+final class Escritorio {
+    let id: String                  // identificador estable de la pantalla (sobrevive a reinicios)
+    let pantalla: CGDirectDisplayID
+    let nombre: String
+    let ventana: NSWindow
+    let player = AVQueuePlayer()
+    var tarea: Task<Void, Never>?
+    var ruta: String?               // vídeo que tiene cargado (ruta relativa)
+    var observador: NSKeyValueObservation?
+
+    init(id: String, pantalla: CGDirectDisplayID, nombre: String, ventana: NSWindow) {
+        self.id = id
+        self.pantalla = pantalla
+        self.nombre = nombre
+        self.ventana = ventana
+    }
+}
+
+struct InfoPantalla: Identifiable, Hashable {
+    let id: String
+    let nombre: String
+    let principal: Bool
+}
+
+func identificar(_ p: NSScreen) -> (id: String, numero: CGDirectDisplayID) {
+    let n = (p.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+    if let uuid = CGDisplayCreateUUIDFromDisplayID(n)?.takeRetainedValue() {
+        return (CFUUIDCreateString(nil, uuid) as String, n)
+    }
+    return (String(n), n)
 }
 
 let formatoBloqueo = "v2-hevc10-4k"
@@ -235,10 +286,7 @@ func itemEnBucle(_ url: URL) async -> AVPlayerItem {
 }
 
 final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, ObservableObject {
-    let player = AVQueuePlayer()
-    var tareaVideo: Task<Void, Never>?
-    var ventanas: [NSWindow] = []
-    var observadores: [NSKeyValueObservation] = []
+    var escritorios: [Escritorio] = []   // el primero es la pantalla principal
     var panel: NSWindow?
     var navegador: NSWindow?
     var nav: Navegador?
@@ -250,9 +298,25 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
     @Published var pausaManual = false
     @Published var inicio = false
     @Published var estado = "Pantalla de bloqueo: lista"
-    @Published var renombrando: URL?   // fondo o carpeta cuyo nombre se está editando en su tarjeta
-    @Published var carpetaActual = carpetaFondos   // carpeta que se está viendo en la ventana
+    @Published var renombrando: URL?   // fondo o carpeta cuyo nombre se está editando
+    @Published var seccion: Seccion = .todos {
+        didSet {
+            if seccion != oldValue { renombrando = nil; refrescar() }
+        }
+    }
     @Published var carpetas: [URL] = []
+    @Published var haySueltos = false   // fondos fuera de cualquier carpeta
+    @Published var pantallasInfo: [InfoPantalla] = []
+
+    // Carpeta que se está viendo (la de los fondos sueltos si la sección no es una carpeta)
+    var carpetaActual: URL {
+        if case .carpeta(let u) = seccion { return u }
+        return carpetaFondos
+    }
+
+    func guardar() {
+        if let d = try? JSONEncoder().encode(ajustes) { try? d.write(to: ajustesURL) }
+    }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         // "WallSakura --quitar-inicio": solo se borra de Ítems de inicio y se cierra
@@ -285,20 +349,17 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         }
         inicio = SMAppService.mainApp.status == .enabled
 
-        player.isMuted = true
-        player.preventsDisplaySleepDuringVideoPlayback = false
         // El bucle va dentro de un solo vídeo largo; al llegar al final (cada ~10 min) vuelve al principio sin cambiar de vídeo
-        player.actionAtItemEnd = .none
         NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification, object: nil, queue: .main) { [weak self] n in
-            guard let self, (n.object as? AVPlayerItem) === self.player.currentItem else { return }
-            self.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+            guard let e = self?.escritorios.first(where: { $0.player.currentItem === (n.object as? AVPlayerItem) }) else { return }
+            e.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
         }
         for nombre in [AVPlayerItem.playbackStalledNotification, AVPlayerItem.failedToPlayToEndTimeNotification] {
             NotificationCenter.default.addObserver(forName: nombre, object: nil, queue: .main) { [weak self] n in
                 self?.log("vídeo: \(n.name.rawValue) \((n.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?.localizedDescription ?? "")")
             }
         }
-        crearVentanas()
+        crearEscritorios()
         crearMenu()
 
         NotificationCenter.default.addObserver(self, selector: #selector(pantallasCambiadas),
@@ -309,6 +370,7 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
             wnc.addObserver(forName: nombre, object: nil, queue: .main) { [weak self] _ in self?.bloqueado = valor; self?.actualizar() }
         }
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.actualizar() }
+        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in self?.comprobarCambio() }
         // Por si has metido o borrado vídeos a mano en la carpeta
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
@@ -359,7 +421,7 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         refrescar()
         inicio = SMAppService.mainApp.status == .enabled
         if panel == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600),
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 700),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
             w.title = "WallSakura"
             w.titlebarAppearsTransparent = true
@@ -438,26 +500,29 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         NSApp.mainMenu = principal
     }
 
-    // MARK: Ventanas del escritorio
+    // MARK: Ventanas del escritorio (una por pantalla)
 
     // macOS avisa de "cambio de pantalla" muchas veces (al abrir apps, cambiar de escritorio…). Si siguen las mismas
     // pantallas solo se recolocan las ventanas; destruirlas y crearlas de nuevo hacía parpadear el fondo en negro.
     @objc func pantallasCambiadas() {
         let pantallas = NSScreen.screens
-        if pantallas.count == ventanas.count {
-            for (w, p) in zip(ventanas, pantallas) where w.frame != p.frame {
-                w.setFrame(p.frame, display: true)
+        if pantallas.map({ identificar($0).id }) == escritorios.map(\.id) {
+            for (e, p) in zip(escritorios, pantallas) where e.ventana.frame != p.frame {
+                e.ventana.setFrame(p.frame, display: true)
             }
         } else {
-            log("pantallas: \(ventanas.count) → \(pantallas.count), recreando ventanas del fondo")
-            crearVentanas()
+            log("pantallas: \(escritorios.count) → \(pantallas.count), recreando ventanas del fondo")
+            crearEscritorios()
         }
     }
 
-    func crearVentanas() {
-        ventanas.forEach { $0.close() }
-        observadores = []
-        ventanas = NSScreen.screens.map { pantalla in
+    func crearEscritorios() {
+        for e in escritorios {
+            e.tarea?.cancel()
+            e.ventana.close()
+        }
+        escritorios = NSScreen.screens.enumerated().map { (n, pantalla) in
+            let (id, numero) = identificar(pantalla)
             let w = NSWindow(contentRect: pantalla.frame, styleMask: .borderless, backing: .buffered, defer: false)
             w.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
             w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
@@ -467,23 +532,54 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
             w.isOpaque = false
             w.backgroundColor = .clear
             w.alphaValue = 0
+            let nombre = pantalla.localizedName.isEmpty ? "Pantalla \(n + 1)" : pantalla.localizedName
+            let e = Escritorio(id: id, pantalla: numero, nombre: nombre, ventana: w)
+            e.player.isMuted = true
+            e.player.preventsDisplaySleepDuringVideoPlayback = false
+            e.player.actionAtItemEnd = .none
             let vista = NSView(frame: pantalla.frame)
-            let capa = AVPlayerLayer(player: player)
+            let capa = AVPlayerLayer(player: e.player)
             capa.videoGravity = .resizeAspectFill
-            observadores.append(capa.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak w] capa, _ in
+            e.observador = capa.observe(\.isReadyForDisplay, options: [.initial, .new]) { [weak w] capa, _ in
                 guard capa.isReadyForDisplay else { return }
                 DispatchQueue.main.async {
                     guard let w, w.alphaValue < 1 else { return }
                     NSAnimationContext.runAnimationGroup { $0.duration = 0.8; w.animator().alphaValue = 1 }
                 }
-            })
+            }
             vista.layer = capa
             vista.wantsLayer = true
             w.contentView = vista
             w.setFrame(pantalla.frame, display: true)
             w.orderBack(nil)
-            return w
+            return e
         }
+        pantallasInfo = escritorios.enumerated().map { InfoPantalla(id: $1.id, nombre: $1.nombre, principal: $0 == 0) }
+        cargarEscritorios()
+    }
+
+    // Qué vídeo toca en cada pantalla: la principal, el fondo puesto; las demás, el suyo o el mismo que la principal
+    func cargarEscritorios() {
+        let todos = Dictionary(todosLosFondos().map { (rutaRelativa($0), $0) }, uniquingKeysWith: { a, _ in a })
+        for (n, e) in escritorios.enumerated() {
+            var ruta = ajustes.actual
+            if n > 0, let propia = ajustes.pantallas?[e.id], todos[propia] != nil { ruta = propia }
+            guard ruta != e.ruta else { continue }
+            e.ruta = ruta
+            e.tarea?.cancel()
+            guard let ruta, let url = todos[ruta] else {
+                e.player.removeAllItems()
+                continue
+            }
+            e.player.pause()
+            e.tarea = Task { @MainActor [weak self] in
+                let item = await itemEnBucle(url)
+                guard !Task.isCancelled else { return }
+                e.player.replaceCurrentItem(with: item)
+                self?.actualizar()
+            }
+        }
+        actualizar()
     }
 
     // MARK: Pausa automática
@@ -498,44 +594,69 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         try? h.close()
     }
 
-    // ¿Hay alguna ventana normal (de cualquier app, también la nuestra) a la vista?
-    func ventanaQueTapa() -> String? {
-        guard let lista = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
-        let fondosPropios = Set(ventanas.map { $0.windowNumber })
-        var n: UInt32 = 0
-        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
-        CGGetActiveDisplayList(16, &ids, &n)
-        let pantallas = ids.prefix(Int(n)).map { CGDisplayBounds($0) }
-        let tapa = lista.first { v in
+    // Pantallas que tienen alguna ventana normal (de cualquier app, también la nuestra) a la vista, y de qué app es
+    func pantallasTapadas() -> [CGDirectDisplayID: String] {
+        guard let lista = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return [:] }
+        let propias = Set(escritorios.map { $0.ventana.windowNumber })
+        var tapadas: [CGDirectDisplayID: String] = [:]
+        for v in lista {
             guard (v[kCGWindowLayer as String] as? Int) == 0,
-                  !fondosPropios.contains(v[kCGWindowNumber as String] as? Int ?? -1),
+                  !propias.contains(v[kCGWindowNumber as String] as? Int ?? -1),
                   (v[kCGWindowAlpha as String] as? Double ?? 1) > 0,
                   let d = v[kCGWindowBounds as String] as? NSDictionary,
-                  let b = CGRect(dictionaryRepresentation: d) else { return false }
+                  let b = CGRect(dictionaryRepresentation: d) else { continue }
             // Solo cuenta la parte visible: "Mostrar escritorio" aparta las ventanas a los bordes
-            let visible = pantallas.map { $0.intersection(b) }.filter { !$0.isNull }
-            return visible.contains { $0.width > 200 && $0.height > 200 }
+            for e in escritorios where tapadas[e.pantalla] == nil {
+                let visible = CGDisplayBounds(e.pantalla).intersection(b)
+                if !visible.isNull && visible.width > 200 && visible.height > 200 {
+                    tapadas[e.pantalla] = v[kCGWindowOwnerName as String] as? String ?? "?"
+                }
+            }
         }
-        return tapa.map { $0[kCGWindowOwnerName as String] as? String ?? "?" }
+        return tapadas
     }
 
+    // Cada pantalla se pausa por su cuenta: si tapas una, la otra sigue moviéndose
     func actualizar() {
-        let tapa = ajustes.pausarConVentanas == false ? nil : ventanaQueTapa()
-        let motivo = bloqueado ? "pantalla bloqueada/apagada" : pausaManual ? "pausa manual" : tapa.map { "ventana de \($0)" }
-        log(motivo.map { "pausa: \($0)" } ?? "reproduciendo")
-        if motivo != nil {
-            if player.rate != 0 { player.pause() }
-        } else if player.rate == 0 {
-            player.play()
+        let tapadas = ajustes.pausarConVentanas == false ? [:] : pantallasTapadas()
+        var resumen: [String] = []
+        for e in escritorios {
+            let motivo = bloqueado ? "pantalla bloqueada/apagada" : pausaManual ? "pausa manual" : tapadas[e.pantalla].map { "ventana de \($0)" }
+            if motivo != nil {
+                if e.player.rate != 0 { e.player.pause() }
+            } else if e.player.rate == 0 && e.player.currentItem != nil {
+                e.player.play()
+            }
+            resumen.append((escritorios.count > 1 ? "\(e.nombre): " : "") + (motivo.map { "pausa: \($0)" } ?? "reproduciendo"))
         }
+        log(resumen.joined(separator: " | "))
     }
 
     // MARK: Cambiar de fondo
 
     func refrescar() {
-        if !FileManager.default.fileExists(atPath: carpetaActual.path) { carpetaActual = carpetaFondos }
-        carpetas = carpetaActual == carpetaFondos ? carpetasDeFondos() : []
-        lista = fondos()
+        carpetas = carpetasDeFondos()
+        haySueltos = !fondos(en: carpetaFondos).isEmpty
+        if case .carpeta(let u) = seccion, !FileManager.default.fileExists(atPath: u.path) { seccion = .todos; return }
+        switch seccion {
+        case .todos: lista = fondosTodos()
+        case .favoritos: lista = favoritosURLs()
+        case .sueltos: lista = fondos(en: carpetaFondos)
+        case .carpeta(let u): lista = fondos(en: u)
+        case .ajustes: break
+        }
+    }
+
+    // Todos los vídeos, también los de las carpetas, del más reciente al más antiguo
+    func fondosTodos() -> [URL] {
+        let claves: Set<URLResourceKey> = [.addedToDirectoryDateKey, .creationDateKey]
+        return todosLosFondos()
+            .map { u -> (URL, Date) in
+                let v = try? u.resourceValues(forKeys: claves)
+                return (u, v?.addedToDirectoryDate ?? v?.creationDate ?? .distantPast)
+            }
+            .sorted { $0.1 > $1.1 }
+            .map(\.0)
     }
 
     // Vídeos de la carpeta que se está viendo, de más reciente a más antiguo (según cuándo se añadieron)
@@ -608,22 +729,39 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
 
     func elegir(_ url: URL) {
         guard rutaRelativa(url) != ajustes.actual else { return }
+        ajustes.ultimoCambio = Date()   // el cambio automático cuenta desde aquí
         poner(url, bloqueo: true)
     }
 
+    // Pone el fondo en la pantalla principal (y en las que no tienen uno propio) y en la de bloqueo
     func poner(_ url: URL, bloqueo: Bool) {
-        tareaVideo?.cancel()
-        tareaVideo = Task { @MainActor in
-            let item = await itemEnBucle(url)
-            guard !Task.isCancelled else { return }
-            player.replaceCurrentItem(with: item)
-            actualizar()
-        }
         ajustes.actual = rutaRelativa(url)
-        if let d = try? JSONEncoder().encode(ajustes) { try? d.write(to: ajustesURL) }
-        player.pause()
-        actualizar()
+        guardar()
+        cargarEscritorios()
         if bloqueo { prepararBloqueo(url) }
+    }
+
+    func ponerEnPantalla(_ url: URL, _ info: InfoPantalla) {
+        if info.principal { return elegir(url) }
+        var p = ajustes.pantallas ?? [:]
+        p[info.id] = rutaRelativa(url)
+        ajustes.pantallas = p
+        guardar()
+        cargarEscritorios()
+        estado = "\(url.deletingPathExtension().lastPathComponent) puesto en \(info.nombre)"
+    }
+
+    // Vuelve a mostrar en esa pantalla lo mismo que en la principal
+    func igualQuePrincipal(_ info: InfoPantalla) {
+        ajustes.pantallas?[info.id] = nil
+        guardar()
+        cargarEscritorios()
+    }
+
+    // Pantallas donde se ve ese fondo ahora mismo
+    func pantallasCon(_ url: URL) -> [InfoPantalla] {
+        let r = rutaRelativa(url)
+        return zip(escritorios, pantallasInfo).filter { $0.0.ruta == r }.map(\.1)
     }
 
     // Crea el vídeo de la pantalla de bloqueo con el formato de los aéreos de Apple
@@ -782,6 +920,13 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         }
         if let a = ajustes.actual, let n = cambiar(a) { ajustes.actual = n }
         if let b = ajustes.bloqueo, let n = cambiar(b) { ajustes.bloqueo = n }
+        ajustes.favoritos = ajustes.favoritos?.map { cambiar($0) ?? $0 }
+        ajustes.pantallas = ajustes.pantallas?.mapValues { cambiar($0) ?? $0 }
+        if ajustes.cambio?.origen == "carpeta:" + viejo.lastPathComponent, esCarpeta(nuevo) {
+            ajustes.cambio?.origen = "carpeta:" + nuevo.lastPathComponent
+        }
+        for e in escritorios { if let r = e.ruta, let n = cambiar(r) { e.ruta = n } }
+        if case .carpeta(let u) = seccion, u.standardizedFileURL == viejo.standardizedFileURL { seccion = .carpeta(nuevo) }
         if var o = ajustes.orden {
             // Renombrado en la misma carpeta: conserva su sitio
             if viejo.deletingLastPathComponent() == nuevo.deletingLastPathComponent() {
@@ -811,9 +956,14 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
     }
 
     func abrir(_ carpeta: URL) {
-        renombrando = nil
-        carpetaActual = carpeta
-        refrescar()
+        seccion = carpeta == carpetaFondos ? .sueltos : .carpeta(carpeta)
+    }
+
+    // Quita de favoritos y de las pantallas lo que ya no existe
+    func olvidar(_ ruta: String) {
+        ajustes.favoritos?.removeAll { $0 == ruta || $0.hasPrefix(ruta + "/") }
+        ajustes.pantallas = ajustes.pantallas?.filter { $0.value != ruta && !$0.value.hasPrefix(ruta + "/") }
+        guardar()
     }
 
     @discardableResult
@@ -830,7 +980,7 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         reubicado(de: url, a: destino)
         ponerPrimero(destino)
         refrescar()
-        estado = "\(nombre) movido a \(carpeta == carpetaFondos ? "Todos los fondos" : carpeta.lastPathComponent)"
+        estado = "\(nombre) movido a \(carpeta == carpetaFondos ? "Sin carpeta" : carpeta.lastPathComponent)"
         return destino
     }
 
@@ -852,8 +1002,10 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         let n = fondos(en: carpeta).count
         guard confirmarBorrado("¿Eliminar la carpeta «\(carpeta.lastPathComponent)»" + (n > 0 ? " y sus \(n) fondos?" : "?")) else { return }
         let teniaActual = ajustes.actual?.hasPrefix(rutaRelativa(carpeta) + "/") == true
+        let ruta = rutaRelativa(carpeta)
         do {
             try FileManager.default.removeItem(at: carpeta)
+            olvidar(ruta)
         } catch {
             estado = "No se pudo eliminar la carpeta"
             return
@@ -868,10 +1020,9 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         if let otro = lista.first ?? todosLosFondos().first {
             poner(otro, bloqueo: true)
         } else {
-            tareaVideo?.cancel()
-            player.removeAllItems()
             ajustes.actual = nil
-            if let d = try? JSONEncoder().encode(ajustes) { try? d.write(to: ajustesURL) }
+            guardar()
+            cargarEscritorios()
         }
     }
 
@@ -891,8 +1042,10 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         let nombre = url.deletingPathExtension().lastPathComponent
         guard confirmarBorrado("¿Eliminar «\(nombre)»?") else { return }
         let eraActual = rutaRelativa(url) == ajustes.actual
+        let ruta = rutaRelativa(url)
         do {
             try FileManager.default.removeItem(at: url)
+            olvidar(ruta)
         } catch {
             estado = "No se pudo eliminar \(nombre)"
             return
@@ -924,6 +1077,89 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         inicio = s.status == .enabled
     }
 
+    // MARK: Favoritos
+
+    func esFavorito(_ url: URL) -> Bool { ajustes.favoritos?.contains(rutaRelativa(url)) == true }
+
+    func alternarFavorito(_ url: URL) {
+        var f = ajustes.favoritos ?? []
+        let r = rutaRelativa(url)
+        if let i = f.firstIndex(of: r) { f.remove(at: i) } else { f.insert(r, at: 0) }
+        ajustes.favoritos = f
+        guardar()
+        refrescar()
+    }
+
+    func favoritosURLs() -> [URL] {
+        let todos = Dictionary(todosLosFondos().map { (rutaRelativa($0), $0) }, uniquingKeysWith: { a, _ in a })
+        return (ajustes.favoritos ?? []).compactMap { todos[$0] }
+    }
+
+    // Arrastrar un favorito sobre otro cambia su orden (o lo añade si no lo era)
+    func soltarEnFavoritos(_ urls: [URL], sobre destino: URL?) -> Bool {
+        var f = ajustes.favoritos ?? []
+        for u in urls where extensiones.contains(u.pathExtension.lowercased()) {
+            let r = rutaRelativa(u)
+            let desde = f.firstIndex(of: r)
+            f.removeAll { $0 == r }
+            if let destino, let hasta = f.firstIndex(of: rutaRelativa(destino)) {
+                f.insert(r, at: min(hasta + ((desde ?? Int.max) <= hasta ? 1 : 0), f.count))
+            } else {
+                f.insert(r, at: 0)
+            }
+        }
+        ajustes.favoritos = f
+        guardar()
+        refrescar()
+        return true
+    }
+
+    // MARK: Cambio automático
+
+    var cambio: CambioAuto { ajustes.cambio ?? CambioAuto() }
+
+    func ajustarCambio(_ cambiar: (inout CambioAuto) -> Void) {
+        var c = cambio
+        let antes = c.activo
+        cambiar(&c)
+        ajustes.cambio = c
+        if c.activo && !antes { ajustes.ultimoCambio = Date() }
+        guardar()
+    }
+
+    func fondosDe(origen: String) -> [URL] {
+        if origen == "favoritos" { return favoritosURLs() }
+        if origen.hasPrefix("carpeta:") { return fondos(en: carpetaFondos.appendingPathComponent(String(origen.dropFirst(8)))) }
+        return fondosTodos()
+    }
+
+    func comprobarCambio() {
+        guard cambio.activo, !bloqueado else { return }
+        let ultimo = ajustes.ultimoCambio ?? .distantPast
+        if Date().timeIntervalSince(ultimo) >= Double(cambio.minutos) * 60 { cambiarAhora() }
+    }
+
+    func cambiarAhora() {
+        ajustes.ultimoCambio = Date()
+        guardar()
+        let lista = fondosDe(origen: cambio.origen)
+        let otros = lista.filter { rutaRelativa($0) != ajustes.actual }
+        guard !otros.isEmpty else {
+            estado = "Cambio automático: no hay otro fondo en esa lista"
+            return
+        }
+        let siguiente: URL
+        if cambio.aleatorio {
+            siguiente = otros.randomElement()!
+        } else {
+            let i = lista.firstIndex { rutaRelativa($0) == ajustes.actual } ?? -1
+            siguiente = lista[(i + 1) % lista.count]
+        }
+        log("cambio automático: \(rutaRelativa(siguiente))")
+        poner(siguiente, bloqueo: true)
+        estado = "Cambio automático: \(siguiente.deletingPathExtension().lastPathComponent)"
+    }
+
     func salir() { NSApp.terminate(nil) }
 }
 
@@ -943,7 +1179,8 @@ extension Color {
     static let rosa = segunModo(claro: 0xE5487F, oscuro: 0xC2386E)          // botones, selección, casillas
     static let fondoArriba = segunModo(claro: 0xFFF6F9, oscuro: 0x1D1016)   // degradado de la ventana
     static let fondoAbajo = segunModo(claro: 0xFCE3ED, oscuro: 0x2B1320)
-    static let panelRosa = segunModo(claro: 0xFFFFFF, oscuro: 0x3A1A2A)     // tarjetas de carpeta y barra de abajo
+    static let panelRosa = segunModo(claro: 0xFFFFFF, oscuro: 0x3A1A2A)     // paneles
+    static let lateral = segunModo(claro: 0xFBE6EF, oscuro: 0x22101A)       // barra lateral
 }
 
 struct FondoRosa: View {
@@ -954,47 +1191,169 @@ struct FondoRosa: View {
 
 struct Panel: View {
     @ObservedObject var fondo: Fondo
-    let columnas = [GridItem(.adaptive(minimum: 200), spacing: 16)]
+
+    var body: some View {
+        NavigationSplitView {
+            BarraLateral(fondo: fondo)
+                .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 300)
+        } detail: {
+            Group {
+                if fondo.seccion == .ajustes {
+                    VistaAjustes(fondo: fondo)
+                } else {
+                    Galeria(fondo: fondo)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(FondoRosa())
+        }
+        .tint(.rosa)
+        .frame(minWidth: 820, minHeight: 520)
+    }
+}
+
+// MARK: Barra lateral
+
+struct BarraLateral: View {
+    @ObservedObject var fondo: Fondo
+    @State private var sobreFavoritos = false
+
+    var body: some View {
+        List(selection: Binding(get: { fondo.seccion }, set: { if let s = $0 { fondo.seccion = s } })) {
+            Section("Biblioteca") {
+                Label("Todos los fondos", systemImage: "square.grid.2x2").tag(Seccion.todos)
+                Label("Favoritos", systemImage: "heart").tag(Seccion.favoritos)
+                    // Suelta un fondo aquí para marcarlo como favorito
+                    .dropDestination(for: URL.self) { urls, _ in fondo.soltarEnFavoritos(urls, sobre: nil) }
+                if fondo.haySueltos {
+                    Label("Sin carpeta", systemImage: "tray").tag(Seccion.sueltos)
+                        .dropDestination(for: URL.self) { urls, _ in fondo.soltar(urls, en: carpetaFondos) }
+                }
+            }
+            Section("Carpetas") {
+                ForEach(fondo.carpetas, id: \.self) { c in
+                    FilaCarpeta(fondo: fondo, url: c).tag(Seccion.carpeta(c))
+                }
+                Button { fondo.nuevaCarpeta() } label: {
+                    Label("Nueva carpeta", systemImage: "plus")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+            }
+            Section("Descubrir") {
+                Button { fondo.mostrarNavegador() } label: {
+                    Label("Explorar fondos", systemImage: "globe")
+                }
+                .buttonStyle(.plain)
+            }
+            Section {
+                Label("Ajustes", systemImage: "gearshape").tag(Seccion.ajustes)
+            }
+        }
+        .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .background(Color.lateral)
+    }
+}
+
+struct FilaCarpeta: View {
+    @ObservedObject var fondo: Fondo
+    let url: URL
+    @State private var texto = ""
+    @FocusState private var enfocado: Bool
+
+    var body: some View {
+        let n = fondo.fondos(en: url).count
+        Group {
+            if fondo.renombrando == url {
+                TextField("Nombre", text: $texto)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($enfocado)
+                    .onAppear {
+                        texto = url.lastPathComponent
+                        DispatchQueue.main.async { enfocado = true }
+                    }
+                    .onSubmit { fondo.renombrar(url, a: texto) }
+                    .onExitCommand { fondo.renombrando = nil }
+                    .onChange(of: enfocado) { _, ahora in
+                        if !ahora && fondo.renombrando == url { fondo.renombrar(url, a: texto) }
+                    }
+            } else {
+                Label(url.lastPathComponent, systemImage: "folder")
+                    .badge(n)
+            }
+        }
+        // Arrastra un fondo encima para meterlo en la carpeta
+        .dropDestination(for: URL.self) { urls, _ in fondo.soltar(urls, en: url) }
+        .contextMenu {
+            Button("Renombrar") { fondo.renombrando = url }
+            Button("Mostrar en Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+            Divider()
+            Button("Eliminar carpeta", role: .destructive) { fondo.eliminarCarpeta(url) }
+        }
+    }
+}
+
+// MARK: Galería de fondos
+
+struct Galeria: View {
+    @ObservedObject var fondo: Fondo
+    let columnas = [GridItem(.adaptive(minimum: 210), spacing: 18)]
+
+    var titulo: String {
+        switch fondo.seccion {
+        case .todos: "Todos los fondos"
+        case .favoritos: "Favoritos"
+        case .sueltos: "Sin carpeta"
+        case .carpeta(let u): u.lastPathComponent
+        case .ajustes: "Ajustes"
+        }
+    }
+
+    var vacio: String {
+        switch fondo.seccion {
+        case .favoritos: "Aún no tienes favoritos. Pulsa el corazón de un fondo o arrástralo a «Favoritos»."
+        case .carpeta: "Carpeta vacía. Arrastra fondos a su nombre en la barra lateral."
+        default: "No hay vídeos. Pulsa «Explorar fondos» o «Añadir vídeo» para empezar."
+        }
+    }
+
+    // Se puede cambiar el orden arrastrando dentro de una carpeta, en «Sin carpeta» y en Favoritos
+    var reordenable: Bool { fondo.seccion != .todos }
 
     @ViewBuilder var menuVacio: some View {
-        if fondo.carpetaActual == carpetaFondos {
-            Button("Nueva carpeta") { fondo.nuevaCarpeta() }
-        }
         Button("Añadir vídeo…") { fondo.anadir() }
         Button("Explorar fondos…") { fondo.mostrarNavegador() }
+        Button("Nueva carpeta") { fondo.nuevaCarpeta() }
         Divider()
         Button("Abrir en Finder") { fondo.abrirCarpeta() }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 10) {
-                if fondo.carpetaActual != carpetaFondos {
-                    Button { fondo.abrir(carpetaFondos) } label: { Label("Todos los fondos", systemImage: "chevron.left") }
-                        // Soltar aquí un fondo lo saca de la carpeta
-                        .dropDestination(for: URL.self) { urls, _ in fondo.soltar(urls, en: carpetaFondos) }
-                    Text(fondo.carpetaActual.lastPathComponent).font(.title2.bold())
-                } else {
-                    Text("Todos los fondos").font(.title2.bold())
-                }
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(titulo).font(.largeTitle.bold())
+                Text(fondo.lista.count == 1 ? "1 fondo" : "\(fondo.lista.count) fondos").foregroundStyle(.secondary)
                 Spacer()
+                Button { fondo.alternarPausa() } label: {
+                    Label(fondo.pausaManual ? "Reanudar" : "Pausar", systemImage: fondo.pausaManual ? "play.fill" : "pause.fill")
+                }
+                .help(fondo.pausaManual ? "Volver a mover el fondo" : "Parar el fondo animado")
+                Button { fondo.anadir() } label: { Label("Añadir vídeo", systemImage: "plus") }
+                    .buttonStyle(.borderedProminent)
             }
-            if fondo.lista.isEmpty && fondo.carpetas.isEmpty {
-                Text(fondo.carpetaActual == carpetaFondos
-                     ? "No hay vídeos. Pulsa «Explorar fondos…» o «Añadir vídeo…» para empezar."
-                     : "Carpeta vacía. Arrastra fondos aquí o al nombre de la carpeta.")
+            if fondo.lista.isEmpty {
+                Text(vacio)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .contentShape(Rectangle())
                     .contextMenu { menuVacio }
             } else {
                 ScrollView {
-                    LazyVGrid(columns: columnas, spacing: 16) {
-                        ForEach(fondo.carpetas, id: \.self) { carpeta in
-                            TarjetaCarpeta(fondo: fondo, url: carpeta)
-                        }
+                    LazyVGrid(columns: columnas, spacing: 18) {
                         ForEach(fondo.lista, id: \.self) { url in
-                            Tarjeta(fondo: fondo, url: url)
+                            Tarjeta(fondo: fondo, url: url, reordenable: reordenable,
+                                    subtitulo: fondo.seccion == .todos || fondo.seccion == .favoritos ? carpetaDe(url) : nil)
                         }
                     }
                     .padding(4)
@@ -1007,33 +1366,15 @@ struct Panel: View {
             Text(fondo.estado)
                 .font(.callout)
                 .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    Button("Explorar fondos…") { fondo.mostrarNavegador() }
-                        .buttonStyle(.borderedProminent)
-                    Button("Añadir vídeo…") { fondo.anadir() }
-                    Button("Abrir carpeta") { fondo.abrirCarpeta() }
-                    Spacer()
-                    Button("Apagar WallSakura") { fondo.salir() }
-                }
-                HStack(spacing: 18) {
-                    Toggle("Pausado", isOn: Binding(get: { fondo.pausaManual }, set: { _ in fondo.alternarPausa() }))
-                    Toggle("Pausar con ventanas abiertas", isOn: Binding(get: { fondo.ajustes.pausarConVentanas != false }, set: { fondo.cambiarPausaConVentanas($0) }))
-                        .help("Si lo quitas, el fondo se mueve siempre aunque tengas ventanas encima (gasta algo más de batería)")
-                    Toggle("Abrir al iniciar sesión", isOn: Binding(get: { fondo.inicio }, set: { _ in fondo.alternarInicio() }))
-                    Spacer()
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(12)
-            .background(Color.panelRosa.opacity(0.7), in: RoundedRectangle(cornerRadius: 14))
         }
         .padding(20)
-        .frame(minWidth: 680, minHeight: 400)
-        .background(FondoRosa())
-        .tint(.rosa)
         // Vídeos arrastrados desde Finder a la ventana: se añaden a la carpeta abierta
         .dropDestination(for: URL.self) { urls, _ in fondo.soltar(urls, en: fondo.carpetaActual) }
+    }
+
+    func carpetaDe(_ url: URL) -> String? {
+        let c = url.deletingLastPathComponent()
+        return c.standardizedFileURL == carpetaFondos.standardizedFileURL ? nil : c.lastPathComponent
     }
 }
 
@@ -1062,42 +1403,7 @@ struct NombreEditable: View {
                     if !ahora && fondo.renombrando == url { fondo.renombrar(url, a: texto) }
                 }
         } else {
-            Text(nombre).fontWeight(negrita ? .semibold : .regular)
-        }
-    }
-}
-
-struct TarjetaCarpeta: View {
-    @ObservedObject var fondo: Fondo
-    let url: URL
-    @State private var encima = false
-
-    var body: some View {
-        let videos = ((try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? [])
-            .filter { extensiones.contains($0.pathExtension.lowercased()) }
-        VStack(spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10).fill(Color.panelRosa.opacity(encima ? 0.95 : 0.6))
-                VStack(spacing: 6) {
-                    Image(systemName: "folder.fill").font(.system(size: 44)).foregroundStyle(Color.rosa)
-                    Text(videos.count == 1 ? "1 fondo" : "\(videos.count) fondos").font(.caption).foregroundStyle(.secondary)
-                }
-            }
-            .frame(height: 120)
-            .frame(maxWidth: .infinity)
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(encima ? Color.rosa : .clear, lineWidth: 3))
-            NombreEditable(fondo: fondo, url: url, nombre: url.lastPathComponent, negrita: false)
-        }
-        .contentShape(Rectangle())
-        .onTapGesture { if fondo.renombrando != url { fondo.abrir(url) } }
-        // Arrastra un fondo encima para meterlo en la carpeta
-        .dropDestination(for: URL.self) { urls, _ in fondo.soltar(urls, en: url) } isTargeted: { encima = $0 }
-        .contextMenu {
-            Button("Abrir") { fondo.abrir(url) }
-            Button("Renombrar") { fondo.renombrando = url }
-            Button("Mostrar en Finder") { NSWorkspace.shared.activateFileViewerSelecting([url]) }
-            Divider()
-            Button("Eliminar carpeta", role: .destructive) { fondo.eliminarCarpeta(url) }
+            Text(nombre).fontWeight(negrita ? .semibold : .regular).lineLimit(1)
         }
     }
 }
@@ -1105,11 +1411,16 @@ struct TarjetaCarpeta: View {
 struct Tarjeta: View {
     @ObservedObject var fondo: Fondo
     let url: URL
+    let reordenable: Bool
+    let subtitulo: String?
     @State private var encima = false
+    @State private var raton = false
 
     var body: some View {
-        let elegido = rutaRelativa(url) == fondo.ajustes.actual
-        VStack(spacing: 8) {
+        let enPantallas = fondo.pantallasCon(url)
+        let elegido = !enPantallas.isEmpty
+        let favorito = fondo.esFavorito(url)
+        VStack(spacing: 6) {
             Group {
                 if let img = fondo.miniatura(url) {
                     Image(nsImage: img).resizable().aspectRatio(contentMode: .fill)
@@ -1117,28 +1428,69 @@ struct Tarjeta: View {
                     Color.black
                 }
             }
-            .frame(height: 120)
+            .frame(height: 126)
             .frame(maxWidth: .infinity)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(elegido ? Color.rosa : .clear, lineWidth: 3))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(elegido ? Color.rosa : .clear, lineWidth: 3))
+            .overlay(alignment: .topTrailing) {
+                // Corazón: siempre visible si es favorito; si no, al pasar el ratón
+                if favorito || raton {
+                    Button { fondo.alternarFavorito(url) } label: {
+                        Image(systemName: favorito ? "heart.fill" : "heart")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(favorito ? Color.rosa : .white)
+                            .padding(7)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(7)
+                    .help(favorito ? "Quitar de favoritos" : "Añadir a favoritos")
+                }
+            }
+            .overlay(alignment: .bottomLeading) {
+                // En qué pantallas está puesto (solo si hay más de una)
+                if fondo.pantallasInfo.count > 1 && elegido {
+                    Text(enPantallas.map(\.nombre).joined(separator: " · "))
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(Color.rosa, in: Capsule())
+                        .foregroundStyle(.white)
+                        .padding(7)
+                }
+            }
             NombreEditable(fondo: fondo, url: url, nombre: url.deletingPathExtension().lastPathComponent, negrita: elegido)
+            if let subtitulo {
+                Label(subtitulo, systemImage: "folder").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
         }
         .contentShape(Rectangle())
+        .onHover { raton = $0 }
         .onTapGesture { if fondo.renombrando != url { fondo.elegir(url) } }
         .draggable(url)
         // Suelta otro fondo encima para ponerlo en este sitio
-        .dropDestination(for: URL.self) { urls, _ in fondo.soltar(urls, sobre: url) } isTargeted: { encima = $0 }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard reordenable else { return false }
+            return fondo.seccion == .favoritos ? fondo.soltarEnFavoritos(urls, sobre: url) : fondo.soltar(urls, sobre: url)
+        } isTargeted: { encima = reordenable && $0 }
         .overlay {
-            if encima { RoundedRectangle(cornerRadius: 12).stroke(Color.rosa, style: StrokeStyle(lineWidth: 2, dash: [6, 4])).padding(-4) }
+            if encima { RoundedRectangle(cornerRadius: 14).stroke(Color.rosa, style: StrokeStyle(lineWidth: 2, dash: [6, 4])).padding(-4) }
         }
         .contextMenu {
             Button("Poner de fondo") { fondo.elegir(url) }
+            if fondo.pantallasInfo.count > 1 {
+                Menu("Poner en pantalla") {
+                    ForEach(fondo.pantallasInfo) { info in
+                        Button(info.nombre + (info.principal ? " (principal)" : "")) { fondo.ponerEnPantalla(url, info) }
+                    }
+                }
+            }
+            Button(favorito ? "Quitar de favoritos" : "Añadir a favoritos") { fondo.alternarFavorito(url) }
             Button("Renombrar") { fondo.renombrando = url }
             Menu("Mover a") {
-                if fondo.carpetaActual != carpetaFondos {
-                    Button("Todos los fondos (sin carpeta)") { fondo.mover(url, a: carpetaFondos) }
+                if url.deletingLastPathComponent().standardizedFileURL != carpetaFondos.standardizedFileURL {
+                    Button("Sin carpeta") { fondo.mover(url, a: carpetaFondos) }
                 }
-                ForEach(carpetasDeFondos().filter { $0 != fondo.carpetaActual }, id: \.self) { c in
+                ForEach(carpetasDeFondos().filter { $0.standardizedFileURL != url.deletingLastPathComponent().standardizedFileURL }, id: \.self) { c in
                     Button(c.lastPathComponent) { fondo.mover(url, a: c) }
                 }
                 Divider()
@@ -1151,6 +1503,94 @@ struct Tarjeta: View {
             Divider()
             Button("Eliminar fondo", role: .destructive) { fondo.eliminar(url) }
         }
+    }
+}
+
+// MARK: Ajustes
+
+struct VistaAjustes: View {
+    @ObservedObject var fondo: Fondo
+
+    let intervalos = [(5, "5 minutos"), (15, "15 minutos"), (30, "30 minutos"), (60, "1 hora"), (180, "3 horas"),
+                      (360, "6 horas"), (720, "12 horas"), (1440, "1 día")]
+
+    func campo<T>(_ ruta: WritableKeyPath<CambioAuto, T>) -> Binding<T> {
+        Binding(get: { fondo.cambio[keyPath: ruta] }, set: { v in fondo.ajustarCambio { $0[keyPath: ruta] = v } })
+    }
+
+    var body: some View {
+        Form {
+            Section("Reproducción") {
+                Toggle("Pausado", isOn: Binding(get: { fondo.pausaManual }, set: { _ in fondo.alternarPausa() }))
+                Toggle(isOn: Binding(get: { fondo.ajustes.pausarConVentanas != false }, set: { fondo.cambiarPausaConVentanas($0) })) {
+                    Text("Pausar con ventanas abiertas")
+                    Text("Cada pantalla se para cuando tiene una ventana encima. Si lo quitas, se mueve siempre (gasta algo más de batería).")
+                }
+            }
+            Section("Cambio automático") {
+                Toggle("Cambiar de fondo automáticamente", isOn: campo(\.activo))
+                Picker("Cada", selection: campo(\.minutos)) {
+                    ForEach(intervalos, id: \.0) { Text($0.1).tag($0.0) }
+                }
+                Picker("Elegir de", selection: campo(\.origen)) {
+                    Text("Todos los fondos").tag("todos")
+                    Text("Favoritos").tag("favoritos")
+                    ForEach(fondo.carpetas, id: \.self) { c in
+                        Text("Carpeta «\(c.lastPathComponent)»").tag("carpeta:" + c.lastPathComponent)
+                    }
+                }
+                Picker("Orden", selection: campo(\.aleatorio)) {
+                    Text("Al azar").tag(true)
+                    Text("Seguido, uno tras otro").tag(false)
+                }
+                HStack {
+                    Spacer()
+                    Button("Cambiar ahora") { fondo.cambiarAhora() }
+                }
+            }
+            Section {
+                if fondo.pantallasInfo.count < 2 {
+                    Text("Solo hay una pantalla. Si conectas otra, aquí podrás ponerle un fondo distinto (o clic derecho en un fondo → «Poner en pantalla»).")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(fondo.pantallasInfo) { info in
+                        if info.principal {
+                            LabeledContent(info.nombre + " (principal)") {
+                                Text(fondo.ajustes.actual.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "—")
+                            }
+                        } else {
+                            Picker(info.nombre, selection: Binding(
+                                get: { fondo.ajustes.pantallas?[info.id] ?? "" },
+                                set: { r in
+                                    if r.isEmpty { fondo.igualQuePrincipal(info) }
+                                    else if let u = todosLosFondos().first(where: { rutaRelativa($0) == r }) { fondo.ponerEnPantalla(u, info) }
+                                })) {
+                                Text("Igual que la principal").tag("")
+                                Divider()
+                                ForEach(fondo.fondosTodos(), id: \.self) { u in
+                                    Text(u.deletingPathExtension().lastPathComponent).tag(rutaRelativa(u))
+                                }
+                            }
+                        }
+                    }
+                }
+            } header: {
+                Text("Pantallas")
+            } footer: {
+                Text("La pantalla de bloqueo muestra el fondo de la pantalla principal.").foregroundStyle(.secondary)
+            }
+            Section("General") {
+                Toggle("Abrir al iniciar sesión", isOn: Binding(get: { fondo.inicio }, set: { _ in fondo.alternarInicio() }))
+                LabeledContent("Estado", value: fondo.estado)
+                HStack {
+                    Button("Abrir carpeta de fondos") { NSWorkspace.shared.open(carpetaFondos) }
+                    Spacer()
+                    Button("Apagar WallSakura", role: .destructive) { fondo.salir() }
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
     }
 }
 
