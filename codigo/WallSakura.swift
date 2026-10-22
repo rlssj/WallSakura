@@ -121,7 +121,7 @@ struct CambioAuto: Codable, Equatable {
 
 // Secciones de la barra lateral
 enum Seccion: Hashable {
-    case todos, favoritos, sueltos, ajustes
+    case todos, favoritos, sueltos, explorar, ajustes
     case carpeta(URL)
 }
 
@@ -288,8 +288,8 @@ func itemEnBucle(_ url: URL) async -> AVPlayerItem {
 final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, ObservableObject {
     var escritorios: [Escritorio] = []   // el primero es la pantalla principal
     var panel: NSWindow?
-    var navegador: NSWindow?
-    var nav: Navegador?
+    @Published var nav: Navegador?   // navegador de "Explorar fondos" (se crea la primera vez que entras)
+    var cargandoNavegador = false
     var bloqueado = false
     var tareaBloqueo: Task<Void, Never>?
     var miniaturas: [URL: NSImage] = [:]
@@ -302,6 +302,7 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
     @Published var seccion: Seccion = .todos {
         didSet {
             if seccion != oldValue { renombrando = nil; refrescar() }
+            if seccion == .explorar { prepararNavegador() }
         }
     }
     @Published var carpetas: [URL] = []
@@ -437,46 +438,38 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    // "Explorar fondos" va dentro de la ventana principal, como una sección más
     func mostrarNavegador() {
-        guard navegador == nil else {
-            // Al volver a abrirlo empieza en la página principal de la última web elegida
-            if navegador?.isVisible == false, let nav { nav.ir(nav.inicio) }
-            NSApp.setActivationPolicy(.regular)
-            navegador?.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            return
+        mostrarPanel()
+        seccion = .explorar
+    }
+
+    func prepararNavegador() {
+        // Ancha: muchas webs (p. ej. WallsFlow) esconden su barra lateral si la página mide menos de ~1300 px
+        if let w = panel, w.frame.width < 1500, let pantalla = (w.screen ?? NSScreen.main)?.visibleFrame {
+            var f = w.frame
+            f.size.width = min(1600, pantalla.width * 0.96)
+            f.size.height = max(f.height, min(900, pantalla.height * 0.92))
+            f.origin.x = pantalla.minX + (pantalla.width - f.width) / 2
+            f.origin.y = max(pantalla.minY, min(f.origin.y, pantalla.maxY - f.height))
+            w.setFrame(f, display: true, animate: true)
         }
+        guard nav == nil, !cargandoNavegador else { return }
+        cargandoNavegador = true
         Task { @MainActor in
             let bloqueador = CommandLine.arguments.contains("--sin-bloqueador") ? [] : await cargarFiltros()
             log("bloqueador: \(bloqueador.count) listas de filtros activas")
-            guard navegador == nil else { return }
-            let n = Navegador(fondo: self, bloqueador: bloqueador)
-            // Ancha por defecto: muchas webs (p. ej. WallsFlow) esconden su barra lateral por debajo de ~1300 px
-            let pantalla = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
-            let tam = NSSize(width: min(1500, pantalla.width * 0.95), height: min(950, pantalla.height * 0.92))
-            let w = NSWindow(contentRect: NSRect(origin: .zero, size: tam),
-                             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-            w.title = "Explorar fondos"
-            if let i = CommandLine.arguments.firstIndex(of: "--ancho"), i + 1 < CommandLine.arguments.count, let a = Double(CommandLine.arguments[i + 1]) {
-                w.setContentSize(NSSize(width: a, height: 750))
-            }
-            w.isReleasedWhenClosed = false
-            w.delegate = self
-            w.contentView = NSHostingView(rootView: Explorador(nav: n))
-            w.center()
-            nav = n
-            navegador = w
-            NSApp.setActivationPolicy(.regular)
-            w.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            nav = Navegador(fondo: self, bloqueador: bloqueador)
+            cargandoNavegador = false
         }
     }
 
     // Al cerrar las ventanas la app desaparece del Dock pero el fondo sigue
     func windowWillClose(_ notification: Notification) {
-        guard let w = notification.object as? NSWindow, w === panel || w === navegador else { return }
-        let otras = [panel, navegador].compactMap { $0 }.filter { $0 !== w && $0.isVisible }
-        if otras.isEmpty { NSApp.setActivationPolicy(.accessory) }
+        guard let w = notification.object as? NSWindow, w === panel else { return }
+        NSApp.setActivationPolicy(.accessory)
+        // La próxima vez que entres a Explorar, empieza en la página principal de la última web elegida
+        if let nav { nav.ir(nav.inicio) }
     }
 
     // ⌘Q y ⌘W solo cierran la ventana; para apagar el fondo está el botón "Apagar"
@@ -643,7 +636,7 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         case .favoritos: lista = favoritosURLs()
         case .sueltos: lista = fondos(en: carpetaFondos)
         case .carpeta(let u): lista = fondos(en: u)
-        case .ajustes: break
+        case .ajustes, .explorar: break
         }
     }
 
@@ -1200,6 +1193,12 @@ struct Panel: View {
             Group {
                 if fondo.seccion == .ajustes {
                     VistaAjustes(fondo: fondo)
+                } else if fondo.seccion == .explorar {
+                    if let nav = fondo.nav {
+                        Explorador(nav: nav)
+                    } else {
+                        ProgressView("Preparando el navegador…")
+                    }
                 } else {
                     Galeria(fondo: fondo)
                 }
@@ -1241,10 +1240,7 @@ struct BarraLateral: View {
                 .foregroundStyle(.secondary)
             }
             Section("Descubrir") {
-                Button { fondo.mostrarNavegador() } label: {
-                    Label("Explorar fondos", systemImage: "globe")
-                }
-                .buttonStyle(.plain)
+                Label("Explorar fondos", systemImage: "globe").tag(Seccion.explorar)
             }
             Section {
                 Label("Ajustes", systemImage: "gearshape").tag(Seccion.ajustes)
@@ -1307,6 +1303,7 @@ struct Galeria: View {
         case .sueltos: "Sin carpeta"
         case .carpeta(let u): u.lastPathComponent
         case .ajustes: "Ajustes"
+        case .explorar: "Explorar fondos"
         }
     }
 
@@ -1831,6 +1828,11 @@ struct VistaWeb: NSViewRepresentable {
 struct Explorador: View {
     @ObservedObject var nav: Navegador
 
+    func ajustarZoom(_ ancho: CGFloat) {
+        guard ancho > 0, !CommandLine.arguments.contains("--zoom") else { return }
+        nav.web.pageZoom = min(1, max(0.75, ancho / 1480))
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
@@ -1858,9 +1860,15 @@ struct Explorador: View {
                 .progressViewStyle(.linear)
                 .frame(height: 2)
                 .opacity(nav.progreso < 1 ? 1 : 0)
-            VistaWeb(web: nav.web)
+            // Si no hay sitio para una página de ~1480 px (las barras laterales de WallsFlow y DesktopHut desaparecen
+            // por debajo de eso), se aleja un poco el zoom en vez de dejar la web en modo estrecho
+            GeometryReader { g in
+                VistaWeb(web: nav.web)
+                    .onAppear { ajustarZoom(g.size.width) }
+                    .onChange(of: g.size.width) { _, ancho in ajustarZoom(ancho) }
+            }
         }
-        .frame(minWidth: 900, minHeight: 600)
+        .frame(minWidth: 500, minHeight: 400)
         .tint(.rosa)
     }
 }
