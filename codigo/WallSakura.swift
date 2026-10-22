@@ -104,6 +104,7 @@ struct Ajustes: Codable {
     var firma: String?
     var bloqueo: String?   // qué vídeo (y versión del formato) hay en la pantalla de bloqueo
     var pausarConVentanas: Bool?   // nil = sí (lo de siempre)
+    var moverAlClicEscritorio: Bool?   // nil = sí: al hacer clic en el escritorio se mueve aunque haya ventanas
     var orden: [String: [String]]?   // orden puesto a mano en cada carpeta ("" = Sin carpeta): nombres de archivo
     var favoritos: [String]?   // rutas relativas, en el orden en que se ven
     var cambio: CambioAuto?
@@ -633,9 +634,23 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         return tapadas
     }
 
+    // ¿Has hecho clic en el escritorio? Entonces Finder es la app activa pero ninguna ventana suya está delante
+    func escritorioEnfocado() -> Bool {
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.finder",
+              let lista = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return false }
+        let propias = Set(escritorios.map { $0.ventana.windowNumber })
+        // La primera ventana normal de la lista es la que está más al frente
+        let delante = lista.first { v in
+            (v[kCGWindowLayer as String] as? Int) == 0 && !propias.contains(v[kCGWindowNumber as String] as? Int ?? -1)
+                && (v[kCGWindowAlpha as String] as? Double ?? 1) > 0
+        }
+        return (delante?[kCGWindowOwnerName as String] as? String) != "Finder"
+    }
+
     // Cada pantalla se pausa por su cuenta: si tapas una, la otra sigue moviéndose
     func actualizar() {
-        let tapadas = ajustes.pausarConVentanas == false ? [:] : pantallasTapadas()
+        let clicEnEscritorio = ajustes.moverAlClicEscritorio != false && escritorioEnfocado()
+        let tapadas = ajustes.pausarConVentanas == false || clicEnEscritorio ? [:] : pantallasTapadas()
         var resumen: [String] = []
         for e in escritorios {
             let motivo = bloqueado ? "pantalla bloqueada/apagada" : pausaManual ? "pausa manual" : tapadas[e.pantalla].map { "ventana de \($0)" }
@@ -1628,6 +1643,11 @@ struct VistaAjustes: View {
                 Toggle(isOn: Binding(get: { fondo.ajustes.pausarConVentanas != false }, set: { fondo.cambiarPausaConVentanas($0) })) {
                     Text("Pausar con ventanas abiertas")
                     Text("Cada pantalla se para cuando tiene una ventana encima. Si lo quitas, se mueve siempre (gasta algo más de batería).")
+                }
+                Toggle(isOn: Binding(get: { fondo.ajustes.moverAlClicEscritorio != false },
+                                     set: { fondo.ajustes.moverAlClicEscritorio = $0; fondo.guardar(); fondo.actualizar() })) {
+                    Text("Moverse al hacer clic en el escritorio")
+                    Text("Aunque haya ventanas abiertas, al hacer clic en un hueco del escritorio el fondo se mueve, hasta que vuelvas a otra app.")
                 }
             }
             Section("Cambio automático") {
