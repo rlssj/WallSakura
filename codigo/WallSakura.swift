@@ -387,7 +387,9 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         let wnc = NSWorkspace.shared.notificationCenter
         for (nombre, valor) in [(NSWorkspace.screensDidSleepNotification, true), (NSWorkspace.sessionDidResignActiveNotification, true),
                                 (NSWorkspace.screensDidWakeNotification, false), (NSWorkspace.sessionDidBecomeActiveNotification, false)] {
-            wnc.addObserver(forName: nombre, object: nil, queue: .main) { [weak self] _ in self?.bloqueado = valor; self?.actualizar() }
+            // Los avisos solo adelantan la comprobación; el estado real se mira en actualizar() (al cerrar la tapa
+            // macOS a veces no avisa de que la pantalla se ha vuelto a encender y el fondo se quedaba pausado)
+            wnc.addObserver(forName: nombre, object: nil, queue: .main) { [weak self] _ in _ = valor; self?.actualizar() }
         }
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.actualizar() }
         Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
@@ -647,8 +649,18 @@ final class Fondo: NSObject, NSApplicationDelegate, NSWindowDelegate, Observable
         return (delante?[kCGWindowOwnerName as String] as? String) != "Finder"
     }
 
+    // ¿Está la pantalla bloqueada o apagada ahora mismo?
+    func pantallaBloqueadaAhora() -> Bool {
+        if let sesion = CGSessionCopyCurrentDictionary() as? [String: Any] {
+            if sesion["CGSSessionScreenIsLocked"] as? Bool == true { return true }
+            if sesion[kCGSessionOnConsoleKey as String] as? Bool == false { return true }
+        }
+        return CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    }
+
     // Cada pantalla se pausa por su cuenta: si tapas una, la otra sigue moviéndose
     func actualizar() {
+        bloqueado = pantallaBloqueadaAhora()
         let clicEnEscritorio = ajustes.moverAlClicEscritorio != false && escritorioEnfocado()
         let tapadas = ajustes.pausarConVentanas == false || clicEnEscritorio ? [:] : pantallasTapadas()
         var resumen: [String] = []
